@@ -1,0 +1,17 @@
+{
+  "name": "YueAgent - 校园 AI 月老",
+  "short_name": "YueAgent",
+  "description": "每周一次深度匹配的校园 AI 月老 Demo",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7fafc",
+  "theme_color": "#0f766e",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "48x48",
+      "type": "image/x-icon"
+    }
+  ]
+}

@@ -1,36 +1,61 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# YueAgent MVP
 
-## Getting Started
+校园 AI 月老 Demo，基于 Next.js 15 + Supabase + Vercel AI SDK v6。
 
-First, run the development server:
+## 已实现功能
+
+- 首页：品牌介绍 + 每周二 21:00 匹配倒计时
+- 认证：邮箱注册 / 登录 / 找回密码（Supabase Auth）
+- 问卷：10 题问卷，JSONB 存储到 `questionnaires`
+- 匹配：`/api/match` 调用 AI SDK 工具链，输出最佳匹配 + 兼容度 + 理由
+- 结果页：Framer Motion 动画揭晓 + Agent 决策 JSON 导出
+- PWA：`manifest.json` + `next-pwa`（构建时生成 `sw.js`）
+
+## 快速开始
+
+1. 安装依赖
+
+```bash
+npm install
+```
+
+2. 配置环境变量
+
+```bash
+cp .env.example .env.local
+```
+
+3. 在 Supabase SQL Editor 执行建表脚本
+
+- `supabase/schema.sql`
+
+4. 启动开发环境
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+5. 生产构建验证
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+npm run lint
+npm run build
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## 关键环境变量
 
-## Learn More
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY`（用于服务端读取候选和写入 `matches`）
+- `LLM_API_KEY`
+- `LLM_BASE_URL`（智谱 OpenAI 协议示例：`https://open.bigmodel.cn/api/coding/paas/v4`）
+- `LLM_MODEL`（示例：`GLM-4.7`）
+- 可选：`OPENROUTER_API_KEY` / `OPENAI_API_KEY`
 
-To learn more about Next.js, take a look at the following resources:
+## 目录
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `src/app`：页面与 API
+- `src/components`：问卷、倒计时、结果卡
+- `src/lib`：Supabase 客户端与匹配逻辑
+- `public/manifest.json`：PWA 清单
+- `supabase/schema.sql`：数据库脚本
