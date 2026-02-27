@@ -92,7 +92,7 @@ export default function QuestionnairePage() {
       updatedAt: new Date().toISOString(),
     };
 
-    const { error } = await supabase.from("questionnaires").upsert(
+    const { error: upsertError } = await supabase.from("questionnaires").upsert(
       {
         user_id: userId,
         answers: payload,
@@ -102,10 +102,58 @@ export default function QuestionnairePage() {
       },
     );
 
-    if (error) {
-      setSubmitting(false);
-      setStatus(`保存失败：${error.message}`);
-      return;
+    if (upsertError) {
+      const needFallback =
+        upsertError.code === "42P10" ||
+        upsertError.message.includes("no unique or exclusion constraint");
+
+      if (!needFallback) {
+        setSubmitting(false);
+        setStatus(`保存失败：${upsertError.message}`);
+        return;
+      }
+
+      const { data: existing, error: selectError } = await supabase
+        .from("questionnaires")
+        .select("id")
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      if (selectError) {
+        setSubmitting(false);
+        setStatus(
+          `保存失败：${selectError.message}。请先执行 supabase/schema.sql 的唯一约束修复脚本。`,
+        );
+        return;
+      }
+
+      if (existing?.id) {
+        const { error: updateError } = await supabase
+          .from("questionnaires")
+          .update({ answers: payload })
+          .eq("user_id", userId);
+
+        if (updateError) {
+          setSubmitting(false);
+          setStatus(
+            `保存失败：${updateError.message}。请先执行 supabase/schema.sql 的唯一约束修复脚本。`,
+          );
+          return;
+        }
+      } else {
+        const { error: insertError } = await supabase.from("questionnaires").insert({
+          user_id: userId,
+          answers: payload,
+        });
+
+        if (insertError) {
+          setSubmitting(false);
+          setStatus(
+            `保存失败：${insertError.message}。请先执行 supabase/schema.sql 的唯一约束修复脚本。`,
+          );
+          return;
+        }
+      }
     }
 
     setSubmitting(false);

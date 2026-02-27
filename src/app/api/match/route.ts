@@ -1,6 +1,7 @@
+import { createHash, randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { createOpenAI } from "@ai-sdk/openai";
-import { generateText, Output, stepCountIs, tool } from "ai";
+import { generateText } from "ai";
 import { z } from "zod";
 import {
   calculateCompatibility,
@@ -9,7 +10,13 @@ import {
   normalizeAnswers,
 } from "@/lib/matching";
 import { getSupabaseAdminClient } from "@/lib/supabaseAdmin";
-import type { MatchCandidate, MatchDecision, QuestionnaireAnswers } from "@/lib/types";
+import type {
+  AgentEvaluation,
+  MatchArena,
+  MatchCandidate,
+  MatchDecision,
+  QuestionnaireAnswers,
+} from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -19,13 +26,15 @@ const requestSchema = z.object({
   answers: z.unknown().optional(),
 });
 
-const llmDecisionSchema = z.object({
-  candidateUserId: z.string(),
-  candidateName: z.string(),
-  compatibilityScore: z.number().min(0).max(100),
-  summary: z.string().min(12),
-  reason: z.array(z.string().min(6)).min(2).max(5),
-  thoughtProcess: z.string().min(24),
+const agentRoundOutputSchema = z.object({
+  assessments: z.array(
+    z.object({
+      candidateUserId: z.string().min(1),
+      score: z.number().min(0).max(100),
+      rationale: z.string().min(6),
+    }),
+  ),
+  summary: z.string().min(8),
 });
 
 type ModelConfig = {
@@ -34,6 +43,34 @@ type ModelConfig = {
   baseURL: string;
   model: string;
 };
+
+type ArenaAgent = {
+  id: string;
+  name: string;
+  focus: string;
+  weight: number;
+};
+
+const ARENA_AGENTS: ArenaAgent[] = [
+  {
+    id: "value-scout",
+    name: "价值观侦察员",
+    focus: "主看核心价值观与长期关系稳定性。",
+    weight: 0.4,
+  },
+  {
+    id: "lifestyle-scout",
+    name: "生活方式侦察员",
+    focus: "主看兴趣、周末节奏与线下相处摩擦成本。",
+    weight: 0.35,
+  },
+  {
+    id: "future-scout",
+    name: "未来规划侦察员",
+    focus: "主看未来规划可对齐程度与长期协作潜力。",
+    weight: 0.25,
+  },
+];
 
 function resolveModelConfig(): ModelConfig | null {
   if (
@@ -101,6 +138,7 @@ function extractJsonObject(text: string) {
     if (char === "{") {
       depth += 1;
     }
+
     if (char === "}") {
       depth -= 1;
       if (depth === 0) {
@@ -112,60 +150,12 @@ function extractJsonObject(text: string) {
   return null;
 }
 
-function resolveBestDeterministic(
-  currentAnswers: QuestionnaireAnswers,
-  candidates: MatchCandidate[],
-): MatchDecision {
-  const ranking = candidates
-    .map((candidate) => {
-      const compatibility = calculateCompatibility(currentAnswers, candidate.answers);
-      return {
-        candidate,
-        compatibility,
-      };
-    })
-    .sort((left, right) => right.compatibility.score - left.compatibility.score);
+function clampScore(score: number) {
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
 
-  const top = ranking[0] ?? {
-    candidate: {
-      userId: "fallback-user",
-      email: "candidate@example.com",
-      answers: normalizeAnswers(null),
-    },
-    compatibility: {
-      score: 71,
-      summary: "基于默认画像计算，当前结果用于演示流程。",
-      reasons: ["默认数据触发匹配流程", "建议完善真实问卷后重新匹配"],
-    },
-  };
-
-  const candidateName = buildCandidateName(top.candidate.answers, top.candidate.userId);
-
-  const thoughtProcess = [
-    "Step 1: 读取当前用户问卷画像。",
-    "Step 2: 比较候选对象在核心价值观、兴趣和沟通风格上的重叠度。",
-    "Step 3: 综合长期关系意愿分，输出兼容度与理由。",
-    `Step 4: 选择兼容度最高对象 ${candidateName}。`,
-  ].join("\n");
-
-  return {
-    candidateUserId: top.candidate.userId,
-    candidateName,
-    maskedEmail: maskEmail(top.candidate.email),
-    compatibilityScore: top.compatibility.score,
-    summary: top.compatibility.summary,
-    reason: top.compatibility.reasons,
-    thoughtProcess,
-    decisionJson: {
-      engine: "deterministic-fallback",
-      candidateUserId: top.candidate.userId,
-      candidateName,
-      compatibilityScore: top.compatibility.score,
-      reason: top.compatibility.reasons,
-      thoughtProcess,
-      generatedAt: new Date().toISOString(),
-    },
-  };
+function hashPayload(payload: Record<string, unknown>) {
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
 }
 
 async function loadCandidates(currentUserId: string) {
@@ -210,172 +200,104 @@ async function loadCandidates(currentUserId: string) {
   return candidates.length > 0 ? candidates : fallbackCandidates(currentUserId);
 }
 
-async function tryLlmDecision(
-  currentUserId: string,
-  currentEmail: string,
+function deterministicAgentRound(
+  agent: ArenaAgent,
   currentAnswers: QuestionnaireAnswers,
   candidates: MatchCandidate[],
-): Promise<MatchDecision | null> {
-  const modelConfig = resolveModelConfig();
+): AgentEvaluation[] {
+  return candidates.map((candidate) => {
+    const base = calculateCompatibility(currentAnswers, candidate.answers);
+    let delta = 0;
 
-  if (!modelConfig) {
-    return null;
-  }
-
-  const provider = createOpenAI({
-    apiKey: modelConfig.apiKey,
-    baseURL: modelConfig.baseURL,
-  });
-
-  const candidateMap = new Map(candidates.map((candidate) => [candidate.userId, candidate]));
-
-  const tools = {
-    getAllProfiles: tool({
-      description: "获取全部候选匹配对象及其画像（已匿名）",
-      inputSchema: z.object({
-        limit: z.number().int().min(1).max(50).optional(),
-      }),
-      execute: async ({ limit }) => {
-        const max = limit ?? 20;
-        return candidates.slice(0, max).map((candidate) => ({
-          userId: candidate.userId,
-          displayName: buildCandidateName(candidate.answers, candidate.userId),
-          ageRange: candidate.answers.ageRange,
-          major: candidate.answers.major,
-          coreValues: candidate.answers.coreValues,
-          hobbies: candidate.answers.hobbies,
-          weekendPlan: candidate.answers.weekendPlan,
-          datePreference: candidate.answers.datePreference,
-          communicationStyle: candidate.answers.communicationStyle,
-          relationshipValueScore: candidate.answers.relationshipValueScore,
-        }));
-      },
-    }),
-    calculateMatch: tool({
-      description: "输入候选 userId，返回与当前用户的兼容度和理由",
-      inputSchema: z.object({
-        candidateUserId: z.string().min(1),
-      }),
-      execute: async ({ candidateUserId }) => {
-        const candidate = candidateMap.get(candidateUserId);
-
-        if (!candidate) {
-          return {
-            candidateUserId,
-            score: 0,
-            summary: "候选对象不存在",
-            reasons: ["请先调用 getAllProfiles 后再计算"],
-          };
-        }
-
-        const compatibility = calculateCompatibility(currentAnswers, candidate.answers);
-
-        return {
-          candidateUserId,
-          score: compatibility.score,
-          summary: compatibility.summary,
-          reasons: compatibility.reasons,
-        };
-      },
-    }),
-  };
-
-  try {
-    const { output } = await generateText({
-      model: provider.chat(modelConfig.model),
-      system:
-        "你是校园 AI 月老。必须先调用 getAllProfiles，再调用 calculateMatch 至少一次。最终输出 JSON。",
-      prompt: [
-        `当前用户ID: ${currentUserId}`,
-        `当前用户邮箱（仅用于日志）: ${currentEmail || "unknown@example.com"}`,
-        `当前用户问卷: ${JSON.stringify(currentAnswers)}`,
-        "输出字段必须为：candidateUserId, candidateName, compatibilityScore, summary, reason, thoughtProcess",
-      ].join("\n"),
-      tools,
-      stopWhen: stepCountIs(6),
-      output: Output.object({ schema: llmDecisionSchema }),
-    });
-
-    const parsed = llmDecisionSchema.parse(output);
-    const picked = candidateMap.get(parsed.candidateUserId);
-
-    if (!picked) {
-      return null;
+    if (agent.id === "value-scout") {
+      delta = base.reasons[0]?.includes("价值观") ? 6 : -2;
     }
 
-    const deterministic = calculateCompatibility(currentAnswers, picked.answers);
+    if (agent.id === "lifestyle-scout") {
+      delta =
+        currentAnswers.weekendPlan === candidate.answers.weekendPlan
+          ? 4
+          : currentAnswers.hobbies.some((item) =>
+                candidate.answers.hobbies.includes(item),
+              )
+            ? 2
+            : -3;
+    }
 
-    const finalResult: MatchDecision = {
-      candidateUserId: picked.userId,
-      candidateName:
-        parsed.candidateName?.trim() || buildCandidateName(picked.answers, picked.userId),
-      maskedEmail: maskEmail(picked.email),
-      compatibilityScore: Math.round((parsed.compatibilityScore + deterministic.score) / 2),
-      summary: parsed.summary,
-      reason: parsed.reason,
-      thoughtProcess: parsed.thoughtProcess,
-      decisionJson: {
-        engine: "ai-sdk-v6",
-        provider: modelConfig.provider,
-        model: modelConfig.model,
-        inputUserId: currentUserId,
-        candidateUserId: picked.userId,
-        llmOutput: parsed,
-        deterministic,
-        generatedAt: new Date().toISOString(),
-      },
+    if (agent.id === "future-scout") {
+      delta =
+        Math.abs(
+          currentAnswers.relationshipValueScore -
+            candidate.answers.relationshipValueScore,
+        ) <= 1
+          ? 5
+          : -2;
+    }
+
+    return {
+      agentId: agent.id,
+      agentName: agent.name,
+      focus: agent.focus,
+      candidateUserId: candidate.userId,
+      candidateName: buildCandidateName(candidate.answers, candidate.userId),
+      score: clampScore(base.score + delta),
+      rationale: `${agent.name}评估：${base.reasons[0] ?? "匹配稳定性较好"}`,
+      round: 1,
+      voteWeight: agent.weight,
     };
-
-    return finalResult;
-  } catch {
-    return null;
-  }
+  });
 }
 
-async function tryLlmDirectDecision(
-  currentUserId: string,
-  currentEmail: string,
+async function llmAgentRound(
+  modelConfig: ModelConfig,
+  agent: ArenaAgent,
   currentAnswers: QuestionnaireAnswers,
   candidates: MatchCandidate[],
-): Promise<MatchDecision | null> {
-  const modelConfig = resolveModelConfig();
-
-  if (!modelConfig) {
-    return null;
-  }
-
+): Promise<AgentEvaluation[] | null> {
   const provider = createOpenAI({
     apiKey: modelConfig.apiKey,
     baseURL: modelConfig.baseURL,
   });
 
-  const candidateMap = new Map(candidates.map((candidate) => [candidate.userId, candidate]));
   const candidateSummary = candidates.map((candidate) => ({
     userId: candidate.userId,
     displayName: buildCandidateName(candidate.answers, candidate.userId),
-    ageRange: candidate.answers.ageRange,
-    major: candidate.answers.major,
     coreValues: candidate.answers.coreValues,
     hobbies: candidate.answers.hobbies,
     weekendPlan: candidate.answers.weekendPlan,
     datePreference: candidate.answers.datePreference,
     communicationStyle: candidate.answers.communicationStyle,
+    futurePlan: candidate.answers.futurePlan,
     relationshipValueScore: candidate.answers.relationshipValueScore,
   }));
 
   try {
     const { text } = await generateText({
       model: provider.chat(modelConfig.model),
-      system:
-        "你是校园 AI 月老。根据当前用户画像和候选列表，选出最佳匹配对象。你必须只输出一个 JSON 对象，不要输出任何额外文本。",
+      system: [
+        "你是一个匹配竞赛智能体。",
+        `角色：${agent.name}`,
+        `角色关注点：${agent.focus}`,
+        "你必须只返回 JSON 对象，不要返回额外文本。",
+      ].join("\n"),
       prompt: [
-        `当前用户ID: ${currentUserId}`,
-        `当前用户邮箱（仅用于日志）: ${currentEmail || "unknown@example.com"}`,
         `当前用户问卷: ${JSON.stringify(currentAnswers)}`,
         `候选列表: ${JSON.stringify(candidateSummary)}`,
-        "必须从候选列表里选择 candidateUserId。",
-        "输出 JSON 字段：candidateUserId, candidateName, compatibilityScore, summary, reason, thoughtProcess。",
-        "reason 必须是字符串数组（2~5条），compatibilityScore 为 0~100 数字。",
+        "返回格式：",
+        JSON.stringify(
+          {
+            assessments: [
+              {
+                candidateUserId: "string",
+                score: 78,
+                rationale: "string",
+              },
+            ],
+            summary: "string",
+          },
+          null,
+          2,
+        ),
       ].join("\n"),
     });
 
@@ -385,38 +307,172 @@ async function tryLlmDirectDecision(
       return null;
     }
 
-    const parsed = llmDecisionSchema.parse(JSON.parse(jsonText));
-    const picked = candidateMap.get(parsed.candidateUserId);
+    const parsed = agentRoundOutputSchema.parse(JSON.parse(jsonText));
+    const byId = new Map(parsed.assessments.map((item) => [item.candidateUserId, item]));
 
-    if (!picked) {
-      return null;
-    }
+    return candidates.map((candidate) => {
+      const item = byId.get(candidate.userId);
+      const fallback = calculateCompatibility(currentAnswers, candidate.answers);
 
-    const deterministic = calculateCompatibility(currentAnswers, picked.answers);
-
-    return {
-      candidateUserId: picked.userId,
-      candidateName:
-        parsed.candidateName?.trim() || buildCandidateName(picked.answers, picked.userId),
-      maskedEmail: maskEmail(picked.email),
-      compatibilityScore: Math.round((parsed.compatibilityScore + deterministic.score) / 2),
-      summary: parsed.summary,
-      reason: parsed.reason,
-      thoughtProcess: parsed.thoughtProcess,
-      decisionJson: {
-        engine: "ai-sdk-v6-direct-json",
-        provider: modelConfig.provider,
-        model: modelConfig.model,
-        inputUserId: currentUserId,
-        candidateUserId: picked.userId,
-        llmOutput: parsed,
-        deterministic,
-        generatedAt: new Date().toISOString(),
-      },
-    };
+      return {
+        agentId: agent.id,
+        agentName: agent.name,
+        focus: agent.focus,
+        candidateUserId: candidate.userId,
+        candidateName: buildCandidateName(candidate.answers, candidate.userId),
+        score: clampScore(item?.score ?? fallback.score),
+        rationale: item?.rationale ?? `${agent.name}评估：${fallback.reasons[0]}`,
+        round: 1,
+        voteWeight: agent.weight,
+      };
+    });
   } catch {
     return null;
   }
+}
+
+async function buildArenaDecision(
+  userId: string,
+  email: string,
+  currentAnswers: QuestionnaireAnswers,
+  candidates: MatchCandidate[],
+): Promise<MatchDecision> {
+  const modelConfig = resolveModelConfig();
+  const runId = randomUUID();
+  const logs: string[] = [];
+  const allEvaluations: AgentEvaluation[] = [];
+
+  logs.push("Round 1/3 · 多智能体并行打分开始");
+
+  for (const agent of ARENA_AGENTS) {
+    const llmRound =
+      modelConfig === null
+        ? null
+        : await llmAgentRound(modelConfig, agent, currentAnswers, candidates);
+
+    const evaluations =
+      llmRound ?? deterministicAgentRound(agent, currentAnswers, candidates);
+    allEvaluations.push(...evaluations);
+
+    const vote = [...evaluations].sort((a, b) => b.score - a.score)[0];
+    logs.push(
+      `Round 1/3 · ${agent.name} 投票 ${vote.candidateName} (${vote.score.toFixed(0)} 分)`,
+    );
+  }
+
+  const aggregate = candidates
+    .map((candidate) => {
+      const related = allEvaluations.filter(
+        (item) => item.candidateUserId === candidate.userId,
+      );
+      const weightedScore = related.reduce(
+        (sum, item) => sum + item.score * item.voteWeight,
+        0,
+      );
+
+      return {
+        candidate,
+        weightedScore: clampScore(weightedScore),
+        evaluations: related,
+      };
+    })
+    .sort((left, right) => right.weightedScore - left.weightedScore);
+
+  let winner = aggregate[0];
+  let runnerUp = aggregate[1] ?? null;
+
+  const initialGap = runnerUp ? winner.weightedScore - runnerUp.weightedScore : 99;
+  logs.push(`Round 2/3 · 共识差距检查，当前分差 ${initialGap.toFixed(0)} 分`);
+
+  if (runnerUp && initialGap <= 8) {
+    const winnerDeterministic = calculateCompatibility(
+      currentAnswers,
+      winner.candidate.answers,
+    ).score;
+    const runnerUpDeterministic = calculateCompatibility(
+      currentAnswers,
+      runnerUp.candidate.answers,
+    ).score;
+
+    winner.weightedScore = clampScore(winner.weightedScore * 0.85 + winnerDeterministic * 0.15);
+    runnerUp.weightedScore = clampScore(
+      runnerUp.weightedScore * 0.85 + runnerUpDeterministic * 0.15,
+    );
+
+    logs.push(
+      `Round 2/3 · 触发仲裁器，补充可验证规则分（${winnerDeterministic}/${runnerUpDeterministic}）`,
+    );
+
+    const reordered = [winner, runnerUp, ...aggregate.slice(2)].sort(
+      (left, right) => right.weightedScore - left.weightedScore,
+    );
+
+    winner = reordered[0];
+    runnerUp = reordered[1] ?? null;
+  }
+
+  const finalGap = runnerUp ? winner.weightedScore - runnerUp.weightedScore : 99;
+  logs.push(
+    `Round 3/3 · 共识完成，赢家 ${buildCandidateName(winner.candidate.answers, winner.candidate.userId)}，领先 ${finalGap.toFixed(0)} 分`,
+  );
+
+  const winnerName = buildCandidateName(winner.candidate.answers, winner.candidate.userId);
+  const winnerReasons = winner.evaluations
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map((item) => `${item.agentName}：${item.rationale}`);
+
+  const verificationPayload: Record<string, unknown> = {
+    runId,
+    track: "赛道3-智能体驱动应用",
+    lane: "多智能体协作竞赛 + 可验证决策",
+    cycleMinutes: 5,
+    userId,
+    emailMasked: maskEmail(email || "unknown@example.com"),
+    candidateIds: candidates.map((item) => item.userId),
+    evaluations: allEvaluations,
+    finalRanking: aggregate.map((item) => ({
+      candidateUserId: item.candidate.userId,
+      score: item.weightedScore,
+    })),
+    generatedAt: new Date().toISOString(),
+  };
+
+  const arena: MatchArena = {
+    track: "赛道3-智能体驱动应用",
+    lane: "多智能体协作竞赛 + 可验证决策",
+    runId,
+    cycleMinutes: 5,
+    rounds: 3,
+    logs,
+    agentEvaluations: allEvaluations,
+    consensus: {
+      winnerUserId: winner.candidate.userId,
+      winnerName,
+      score: winner.weightedScore,
+      runnerUpUserId: runnerUp?.candidate.userId ?? null,
+      gap: finalGap,
+    },
+    verificationHash: hashPayload(verificationPayload),
+    verificationPayload,
+  };
+
+  return {
+    candidateUserId: winner.candidate.userId,
+    candidateName: winnerName,
+    maskedEmail: maskEmail(winner.candidate.email),
+    compatibilityScore: winner.weightedScore,
+    summary: `3个智能体完成 3 轮竞赛评估后，${winnerName} 以 ${winner.weightedScore}% 兼容度胜出。`,
+    reason: winnerReasons,
+    thoughtProcess: logs.join("\n"),
+    arena,
+    decisionJson: {
+      engine: modelConfig ? "multi-agent-arena-llm+rule" : "multi-agent-arena-rule-only",
+      provider: modelConfig?.provider ?? null,
+      model: modelConfig?.model ?? null,
+      ...arena,
+    },
+  };
 }
 
 async function persistMatch(result: MatchDecision, userId: string) {
@@ -460,19 +516,12 @@ export async function POST(request: Request) {
       );
     }
 
-    const llmResult = await tryLlmDecision(
+    const finalResult = await buildArenaDecision(
       userId,
       email ?? "",
       currentAnswers,
       candidates,
     );
-
-    const llmDirectResult =
-      llmResult ??
-      (await tryLlmDirectDecision(userId, email ?? "", currentAnswers, candidates));
-
-    const finalResult =
-      llmDirectResult ?? resolveBestDeterministic(currentAnswers, candidates);
 
     await persistMatch(finalResult, userId);
 

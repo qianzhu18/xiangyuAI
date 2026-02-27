@@ -51,6 +51,20 @@ export default function MatchResultCard({ result }: MatchResultCardProps) {
         ))}
       </ul>
 
+      <section className="mt-5 rounded-2xl border border-amber-200 bg-white/75 p-4">
+        <p className="text-xs font-semibold tracking-[0.16em] text-slate-500">AGENT ARENA</p>
+        <p className="mt-2 text-sm text-slate-700">
+          赛道：{result.arena.track} · 机制：{result.arena.lane}
+        </p>
+        <p className="mt-1 text-sm text-slate-700">
+          Run ID：{result.arena.runId} · 回合：{result.arena.rounds} · 周期：
+          {result.arena.cycleMinutes} 分钟
+        </p>
+        <p className="mt-2 break-all rounded-lg bg-slate-100 px-3 py-2 font-mono text-xs text-slate-700">
+          验证哈希: {result.arena.verificationHash}
+        </p>
+      </section>
+
       <button
         type="button"
         onClick={exportDecisionJson}

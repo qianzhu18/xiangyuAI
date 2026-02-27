@@ -7,8 +7,8 @@
 - 首页：品牌介绍 + 每周二 21:00 匹配倒计时
 - 认证：邮箱注册 / 登录 / 找回密码（Supabase Auth）
 - 问卷：10 题问卷，JSONB 存储到 `questionnaires`
-- 匹配：`/api/match` 调用 AI SDK 工具链，输出最佳匹配 + 兼容度 + 理由
-- 结果页：Framer Motion 动画揭晓 + Agent 决策 JSON 导出
+- 匹配：`/api/match` 升级为赛道3「多智能体竞赛 + 共识裁决 + 可验证哈希」
+- 结果页：Framer Motion 动画揭晓 + Agent Arena 证据展示 + 决策 JSON 导出
 - PWA：`manifest.json` + `next-pwa`（构建时生成 `sw.js`）
 
 ## 快速开始
@@ -28,6 +28,8 @@ cp .env.example .env.local
 3. 在 Supabase SQL Editor 执行建表脚本
 
 - `supabase/schema.sql`
+- 如果你之前已建过表并出现 `ON CONFLICT` 错误，再执行：
+- `supabase/migrations/20260227_fix_questionnaires_unique.sql`
 
 4. 启动开发环境
 

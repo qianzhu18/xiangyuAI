@@ -83,12 +83,14 @@ export default function MatchPage() {
     };
   }, [router, supabase]);
 
-  const streamThinkingText = async (fullText: string) => {
+  const streamArenaLogs = async (logs: string[]) => {
     setThinkingText("");
 
-    for (const char of fullText) {
-      setThinkingText((previous) => previous + char);
-      await sleep(14);
+    for (const line of logs) {
+      setThinkingText((previous) =>
+        previous.length > 0 ? `${previous}\n${line}` : line,
+      );
+      await sleep(680);
     }
   };
 
@@ -122,8 +124,16 @@ export default function MatchPage() {
         throw new Error(payload?.error ?? "匹配请求失败");
       }
 
-      await streamThinkingText(payload.thoughtProcess ?? "正在分析你的关系画像...");
-      setResult(payload.result as MatchDecision);
+      const nextResult = payload.result as MatchDecision;
+      const logs =
+        nextResult.arena?.logs && nextResult.arena.logs.length > 0
+          ? nextResult.arena.logs
+          : (payload.thoughtProcess as string | undefined)?.split("\n") ?? [
+              "正在分析你的关系画像...",
+            ];
+
+      await streamArenaLogs(logs);
+      setResult(nextResult);
     } catch (error) {
       const message = error instanceof Error ? error.message : "匹配失败，请稍后重试。";
       setStatus(message);
@@ -161,7 +171,7 @@ export default function MatchPage() {
         <div>
           <h1 className="font-display text-3xl text-slate-900">本周匹配</h1>
           <p className="mt-2 text-sm text-slate-600">
-            点击按钮运行 Agent，展示决策过程并揭晓结果。
+            赛道3模式：3 个智能体竞赛 + 3 轮共识裁决 + 可验证哈希证据。
           </p>
         </div>
 
@@ -182,7 +192,7 @@ export default function MatchPage() {
           disabled={runningMatch}
           className="inline-flex h-12 items-center justify-center rounded-xl bg-slate-900 px-6 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
         >
-          {runningMatch ? "Agent 计算中..." : "本周匹配"}
+          {runningMatch ? "多智能体竞赛中..." : "启动 3-Agent 对战匹配（5分钟轮次仿真）"}
         </button>
 
         {runningMatch ? (
@@ -199,14 +209,16 @@ export default function MatchPage() {
                 transition={{ duration: 2.8, repeat: Infinity, ease: "easeInOut" }}
               />
             </div>
-            <p className="text-sm text-slate-600">正在分析价值观、兴趣和关系节奏...</p>
+            <p className="text-sm text-slate-600">正在进行 Round 1~3 智能体竞赛与共识裁决...</p>
           </motion.div>
         ) : null}
       </div>
 
       {thinkingText ? (
         <article className="mt-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-          <p className="text-xs font-semibold tracking-[0.18em] text-slate-500">AGENT STREAM</p>
+          <p className="text-xs font-semibold tracking-[0.18em] text-slate-500">
+            AGENT ARENA STREAM
+          </p>
           <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-slate-700">{thinkingText}</p>
         </article>
       ) : null}
