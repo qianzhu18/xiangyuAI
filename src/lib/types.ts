@@ -35,6 +35,7 @@ export type MatchArena = {
   runId: string;
   cycleMinutes: number;
   rounds: number;
+  candidateCount: number;
   logs: string[];
   agentEvaluations: AgentEvaluation[];
   consensus: {
@@ -56,6 +57,12 @@ export type MatchDecision = {
   summary: string;
   reason: string[];
   thoughtProcess: string;
+  fitAdvice: {
+    idealPartnerType: string;
+    starterTopics: string[];
+    boundaryHints: string[];
+  };
+  partnerProfile: QuestionnaireAnswers;
   arena: MatchArena;
   decisionJson: Record<string, unknown>;
 };

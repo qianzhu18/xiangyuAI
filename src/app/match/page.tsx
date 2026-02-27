@@ -134,6 +134,18 @@ export default function MatchPage() {
 
       await streamArenaLogs(logs);
       setResult(nextResult);
+
+      if (typeof window !== "undefined") {
+        window.sessionStorage.setItem(
+          "yueagent:last-match-context",
+          JSON.stringify({
+            userEmail,
+            userAnswers: answers,
+            result: nextResult,
+            storedAt: new Date().toISOString(),
+          }),
+        );
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "匹配失败，请稍后重试。";
       setStatus(message);
@@ -186,6 +198,9 @@ export default function MatchPage() {
       </header>
 
       <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+        <p className="mb-4 rounded-xl border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-800">
+          当前为 Demo 加速模式：当真实用户不足时，系统会自动补充模拟用户池，确保每次都能完成匹配。
+        </p>
         <button
           type="button"
           onClick={handleRunMatch}
@@ -226,6 +241,14 @@ export default function MatchPage() {
       {result ? (
         <div className="mt-6">
           <MatchResultCard result={result} />
+          <div className="mt-4">
+            <Link
+              href="/chat"
+              className="inline-flex h-11 items-center justify-center rounded-xl bg-teal-700 px-5 text-sm font-semibold text-white transition hover:bg-teal-800"
+            >
+              进入代理聊天（你Agent ↔ TA Agent）
+            </Link>
+          </div>
         </div>
       ) : null}
 

@@ -4,7 +4,9 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { generateText } from "ai";
 import { z } from "zod";
 import {
+  buildFitAdvice,
   calculateCompatibility,
+  ensureSyntheticCandidatePool,
   fallbackCandidates,
   maskEmail,
   normalizeAnswers,
@@ -21,7 +23,7 @@ import type {
 export const runtime = "nodejs";
 
 const requestSchema = z.object({
-  userId: z.string().min(1),
+  userId: z.string().optional(),
   email: z.string().email().optional(),
   answers: z.unknown().optional(),
 });
@@ -162,7 +164,11 @@ async function loadCandidates(currentUserId: string) {
   const admin = getSupabaseAdminClient();
 
   if (!admin) {
-    return fallbackCandidates(currentUserId);
+    return ensureSyntheticCandidatePool(
+      currentUserId,
+      fallbackCandidates(currentUserId),
+      12,
+    );
   }
 
   const { data, error } = await admin
@@ -171,7 +177,11 @@ async function loadCandidates(currentUserId: string) {
     .neq("user_id", currentUserId);
 
   if (error) {
-    return fallbackCandidates(currentUserId);
+    return ensureSyntheticCandidatePool(
+      currentUserId,
+      fallbackCandidates(currentUserId),
+      12,
+    );
   }
 
   const candidates = (data ?? [])
@@ -197,7 +207,7 @@ async function loadCandidates(currentUserId: string) {
     })
     .filter((item) => item.userId.length > 0);
 
-  return candidates.length > 0 ? candidates : fallbackCandidates(currentUserId);
+  return ensureSyntheticCandidatePool(currentUserId, candidates, 12);
 }
 
 function deterministicAgentRound(
@@ -331,35 +341,16 @@ async function llmAgentRound(
   }
 }
 
-async function buildArenaDecision(
+function composeDecision(
   userId: string,
   email: string,
   currentAnswers: QuestionnaireAnswers,
   candidates: MatchCandidate[],
-): Promise<MatchDecision> {
-  const modelConfig = resolveModelConfig();
-  const runId = randomUUID();
-  const logs: string[] = [];
-  const allEvaluations: AgentEvaluation[] = [];
-
-  logs.push("Round 1/3 · 多智能体并行打分开始");
-
-  for (const agent of ARENA_AGENTS) {
-    const llmRound =
-      modelConfig === null
-        ? null
-        : await llmAgentRound(modelConfig, agent, currentAnswers, candidates);
-
-    const evaluations =
-      llmRound ?? deterministicAgentRound(agent, currentAnswers, candidates);
-    allEvaluations.push(...evaluations);
-
-    const vote = [...evaluations].sort((a, b) => b.score - a.score)[0];
-    logs.push(
-      `Round 1/3 · ${agent.name} 投票 ${vote.candidateName} (${vote.score.toFixed(0)} 分)`,
-    );
-  }
-
+  modelConfig: ModelConfig | null,
+  runId: string,
+  logs: string[],
+  allEvaluations: AgentEvaluation[],
+): MatchDecision {
   const aggregate = candidates
     .map((candidate) => {
       const related = allEvaluations.filter(
@@ -412,11 +403,12 @@ async function buildArenaDecision(
   }
 
   const finalGap = runnerUp ? winner.weightedScore - runnerUp.weightedScore : 99;
+  const winnerName = buildCandidateName(winner.candidate.answers, winner.candidate.userId);
+
   logs.push(
-    `Round 3/3 · 共识完成，赢家 ${buildCandidateName(winner.candidate.answers, winner.candidate.userId)}，领先 ${finalGap.toFixed(0)} 分`,
+    `Round 3/3 · 共识完成，赢家 ${winnerName}，领先 ${finalGap.toFixed(0)} 分`,
   );
 
-  const winnerName = buildCandidateName(winner.candidate.answers, winner.candidate.userId);
   const winnerReasons = winner.evaluations
     .sort((a, b) => b.score - a.score)
     .slice(0, 3)
@@ -444,6 +436,7 @@ async function buildArenaDecision(
     runId,
     cycleMinutes: 5,
     rounds: 3,
+    candidateCount: candidates.length,
     logs,
     agentEvaluations: allEvaluations,
     consensus: {
@@ -465,6 +458,8 @@ async function buildArenaDecision(
     summary: `3个智能体完成 3 轮竞赛评估后，${winnerName} 以 ${winner.weightedScore}% 兼容度胜出。`,
     reason: winnerReasons,
     thoughtProcess: logs.join("\n"),
+    fitAdvice: buildFitAdvice(currentAnswers, winner.candidate.answers),
+    partnerProfile: winner.candidate.answers,
     arena,
     decisionJson: {
       engine: modelConfig ? "multi-agent-arena-llm+rule" : "multi-agent-arena-rule-only",
@@ -473,6 +468,78 @@ async function buildArenaDecision(
       ...arena,
     },
   };
+}
+
+function emergencyDecision(
+  userId: string,
+  email: string,
+  answers: QuestionnaireAnswers,
+) {
+  const emergencyCandidates = ensureSyntheticCandidatePool(
+    userId,
+    fallbackCandidates(userId),
+    12,
+  );
+
+  const logs = [
+    "Round 1/3 · 检测到服务波动，切换应急匹配模式",
+    "Round 2/3 · 使用离线规则完成候选排序",
+    "Round 3/3 · 已输出可用匹配结果与建议",
+  ];
+
+  const evaluations: AgentEvaluation[] = ARENA_AGENTS.flatMap((agent) =>
+    deterministicAgentRound(agent, answers, emergencyCandidates),
+  );
+
+  return composeDecision(
+    userId,
+    email,
+    answers,
+    emergencyCandidates,
+    null,
+    randomUUID(),
+    logs,
+    evaluations,
+  );
+}
+
+async function buildArenaDecision(
+  userId: string,
+  email: string,
+  currentAnswers: QuestionnaireAnswers,
+  candidates: MatchCandidate[],
+): Promise<MatchDecision> {
+  const modelConfig = resolveModelConfig();
+  const runId = randomUUID();
+  const logs: string[] = ["Round 1/3 · 多智能体并行打分开始"];
+  const allEvaluations: AgentEvaluation[] = [];
+
+  for (const agent of ARENA_AGENTS) {
+    const llmRound =
+      modelConfig === null
+        ? null
+        : await llmAgentRound(modelConfig, agent, currentAnswers, candidates);
+
+    const evaluations =
+      llmRound ?? deterministicAgentRound(agent, currentAnswers, candidates);
+    allEvaluations.push(...evaluations);
+
+    const vote = [...evaluations].sort((a, b) => b.score - a.score)[0];
+    logs.push(
+      `Round 1/3 · ${agent.name} 投票 ${vote.candidateName} (${vote.score.toFixed(0)} 分)`,
+    );
+  }
+
+  return composeDecision(
+    userId,
+    email,
+    currentAnswers,
+    candidates,
+    modelConfig,
+    runId,
+    logs,
+    allEvaluations,
+  );
 }
 
 async function persistMatch(result: MatchDecision, userId: string) {
@@ -491,34 +558,24 @@ async function persistMatch(result: MatchDecision, userId: string) {
 }
 
 export async function POST(request: Request) {
+  const raw = await request.json().catch(() => ({} as Record<string, unknown>));
+  const parsed = requestSchema.safeParse(raw);
+
+  const userId = parsed.success ? parsed.data.userId || `guest-${Date.now()}` : `guest-${Date.now()}`;
+  const email = parsed.success ? parsed.data.email ?? "" : "";
+  const currentAnswers = normalizeAnswers(
+    (parsed.success ? parsed.data.answers : raw.answers) as
+      | Partial<QuestionnaireAnswers>
+      | null
+      | undefined,
+  );
+
   try {
-    const payload = await request.json();
-    const parsed = requestSchema.safeParse(payload);
-
-    if (!parsed.success) {
-      return NextResponse.json(
-        { error: "请求参数不完整，请提供 userId" },
-        { status: 400 },
-      );
-    }
-
-    const { userId, email, answers } = parsed.data;
-    const currentAnswers = normalizeAnswers(
-      answers as Partial<QuestionnaireAnswers> | null,
-    );
-
     const candidates = await loadCandidates(userId);
-
-    if (candidates.length === 0) {
-      return NextResponse.json(
-        { error: "暂无可匹配对象，请先让更多用户完成问卷" },
-        { status: 400 },
-      );
-    }
 
     const finalResult = await buildArenaDecision(
       userId,
-      email ?? "",
+      email,
       currentAnswers,
       candidates,
     );
@@ -532,14 +589,15 @@ export async function POST(request: Request) {
       },
       { status: 200 },
     );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "匹配服务异常";
+  } catch {
+    const fallback = emergencyDecision(userId, email, currentAnswers);
 
     return NextResponse.json(
       {
-        error: message,
+        thoughtProcess: fallback.thoughtProcess,
+        result: fallback,
       },
-      { status: 500 },
+      { status: 200 },
     );
   }
 }

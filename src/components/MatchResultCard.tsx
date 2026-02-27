@@ -51,6 +51,29 @@ export default function MatchResultCard({ result }: MatchResultCardProps) {
         ))}
       </ul>
 
+      <section className="mt-5 rounded-2xl border border-teal-200 bg-teal-50/70 p-4">
+        <p className="text-xs font-semibold tracking-[0.16em] text-teal-700">匹配启发建议</p>
+        <p className="mt-2 text-sm text-slate-700">{result.fitAdvice.idealPartnerType}</p>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div>
+            <p className="text-xs font-semibold text-slate-600">破冰话题</p>
+            <ul className="mt-1 space-y-1 text-sm text-slate-700">
+              {result.fitAdvice.starterTopics.map((topic) => (
+                <li key={topic}>· {topic}</li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-slate-600">边界建议</p>
+            <ul className="mt-1 space-y-1 text-sm text-slate-700">
+              {result.fitAdvice.boundaryHints.map((hint) => (
+                <li key={hint}>· {hint}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </section>
+
       <section className="mt-5 rounded-2xl border border-amber-200 bg-white/75 p-4">
         <p className="text-xs font-semibold tracking-[0.16em] text-slate-500">AGENT ARENA</p>
         <p className="mt-2 text-sm text-slate-700">
@@ -58,7 +81,7 @@ export default function MatchResultCard({ result }: MatchResultCardProps) {
         </p>
         <p className="mt-1 text-sm text-slate-700">
           Run ID：{result.arena.runId} · 回合：{result.arena.rounds} · 周期：
-          {result.arena.cycleMinutes} 分钟
+          {result.arena.cycleMinutes} 分钟 · 候选池：{result.arena.candidateCount}
         </p>
         <p className="mt-2 break-all rounded-lg bg-slate-100 px-3 py-2 font-mono text-xs text-slate-700">
           验证哈希: {result.arena.verificationHash}
