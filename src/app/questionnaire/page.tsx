@@ -156,6 +156,30 @@ export default function QuestionnairePage() {
       }
     }
 
+    fetch("/api/secondme/ingest", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        action: "questionnaire_submitted",
+        displayText: "用户完成了一次匹配问卷提交",
+        eventDesc: `displayName=${answers.displayName}, valueScore=${answers.relationshipValueScore}`,
+        importance: 6,
+        channel: "App",
+        payload: {
+          ageRange: answers.ageRange,
+          coreValues: answers.coreValues,
+          hobbies: answers.hobbies,
+          weekendPlan: answers.weekendPlan,
+          datePreference: answers.datePreference,
+          communicationStyle: answers.communicationStyle,
+        },
+      }),
+    }).catch(() => {
+      return;
+    });
+
     setSubmitting(false);
     router.push("/match");
   };

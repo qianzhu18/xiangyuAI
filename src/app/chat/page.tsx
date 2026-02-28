@@ -24,6 +24,12 @@ type MatchContext = {
   storedAt: string;
 };
 
+type SecondMeStatus = {
+  configured: boolean;
+  connected: boolean;
+  memoryCount?: number;
+};
+
 export default function ChatPage() {
   const [context, setContext] = useState<MatchContext | null>(null);
   const [mode, setMode] = useState<ChatMode>("user_to_partner");
@@ -32,6 +38,7 @@ export default function ChatPage() {
   const [transcript, setTranscript] = useState<AgentTranscript[]>([]);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("");
+  const [secondMeStatus, setSecondMeStatus] = useState<SecondMeStatus | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -57,6 +64,37 @@ export default function ChatPage() {
     } catch {
       setStatus("匹配上下文损坏，请回到匹配页重新生成。\n");
     }
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+
+    const loadSecondMeStatus = async () => {
+      const response = await fetch("/api/secondme/status", {
+        cache: "no-store",
+      });
+      const payload = (await response.json()) as SecondMeStatus;
+
+      if (!alive) {
+        return;
+      }
+
+      setSecondMeStatus(payload);
+    };
+
+    loadSecondMeStatus().catch(() => {
+      if (!alive) {
+        return;
+      }
+      setSecondMeStatus({
+        configured: false,
+        connected: false,
+      });
+    });
+
+    return () => {
+      alive = false;
+    };
   }, []);
 
   const candidateName = context?.result.candidateName ?? "对方";
@@ -173,6 +211,18 @@ export default function ChatPage() {
       </header>
 
       <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+        <div className="mb-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+          {secondMeStatus?.configured ? (
+            secondMeStatus.connected ? (
+              <p>SecondMe 已连接：当前聊天将融合你的记忆代理能力（记忆数 {secondMeStatus.memoryCount ?? 0}）。</p>
+            ) : (
+              <p>SecondMe 未连接：当前使用本地代理策略，你可在匹配页先连接 SecondMe。</p>
+            )
+          ) : (
+            <p>SecondMe 未配置，当前仅本地代理可用。</p>
+          )}
+        </div>
+
         <div className="flex flex-wrap gap-2">
           <button
             type="button"

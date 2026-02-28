@@ -10,6 +10,14 @@ import { getSupabaseBrowserClient, isSupabaseConfigured } from "@/lib/supabaseCl
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+type SecondMeStatus = {
+  configured: boolean;
+  connected: boolean;
+  memoryCount?: number;
+  shadesCount?: number;
+  userInfo?: Record<string, unknown> | null;
+};
+
 export default function MatchPage() {
   const router = useRouter();
   const supabase = useMemo(() => getSupabaseBrowserClient(), []);
@@ -23,6 +31,8 @@ export default function MatchPage() {
   const [thinkingText, setThinkingText] = useState("");
   const [result, setResult] = useState<MatchDecision | null>(null);
   const [status, setStatus] = useState("");
+  const [secondMeStatus, setSecondMeStatus] = useState<SecondMeStatus | null>(null);
+  const [secondMeLoading, setSecondMeLoading] = useState(false);
 
   useEffect(() => {
     if (!supabase) {
@@ -82,6 +92,38 @@ export default function MatchPage() {
       alive = false;
     };
   }, [router, supabase]);
+
+  useEffect(() => {
+    let alive = true;
+
+    const loadSecondMeStatus = async () => {
+      const response = await fetch("/api/secondme/status", {
+        cache: "no-store",
+      });
+      const payload = (await response.json()) as SecondMeStatus;
+
+      if (!alive) {
+        return;
+      }
+
+      setSecondMeStatus(payload);
+    };
+
+    loadSecondMeStatus().catch(() => {
+      if (!alive) {
+        return;
+      }
+
+      setSecondMeStatus({
+        configured: false,
+        connected: false,
+      });
+    });
+
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const streamArenaLogs = async (logs: string[]) => {
     setThinkingText("");
@@ -154,6 +196,35 @@ export default function MatchPage() {
     }
   };
 
+  const connectSecondMe = () => {
+    window.location.href = "/api/secondme/oauth/start?returnTo=/match";
+  };
+
+  const disconnectSecondMe = async () => {
+    setSecondMeLoading(true);
+    await fetch("/api/secondme/disconnect", {
+      method: "POST",
+    }).catch(() => {
+      return;
+    });
+
+    const response = await fetch("/api/secondme/status", {
+      cache: "no-store",
+    }).catch(() => null);
+
+    if (response) {
+      const payload = (await response.json()) as SecondMeStatus;
+      setSecondMeStatus(payload);
+    } else {
+      setSecondMeStatus({
+        configured: false,
+        connected: false,
+      });
+    }
+
+    setSecondMeLoading(false);
+  };
+
   if (!configured) {
     return (
       <main className="mx-auto min-h-screen w-full max-w-3xl px-5 py-16 sm:px-8">
@@ -198,6 +269,42 @@ export default function MatchPage() {
       </header>
 
       <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+        <div className="mb-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+          {secondMeStatus?.configured ? (
+            secondMeStatus.connected ? (
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p>
+                  SecondMe 已连接 · 记忆条数 {secondMeStatus.memoryCount ?? 0} · 分身数{" "}
+                  {secondMeStatus.shadesCount ?? 0}
+                </p>
+                <button
+                  type="button"
+                  onClick={disconnectSecondMe}
+                  disabled={secondMeLoading}
+                  className="inline-flex h-9 items-center justify-center rounded-lg border border-slate-300 px-3 text-xs font-medium text-slate-700"
+                >
+                  {secondMeLoading ? "处理中..." : "断开 SecondMe"}
+                </button>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p>SecondMe 未连接：当前可用模拟用户池匹配，连接后可启用记忆增强打分。</p>
+                <button
+                  type="button"
+                  onClick={connectSecondMe}
+                  className="inline-flex h-9 items-center justify-center rounded-lg bg-teal-700 px-3 text-xs font-medium text-white"
+                >
+                  连接 SecondMe
+                </button>
+              </div>
+            )
+          ) : (
+            <p>
+              SecondMe 尚未配置 `SECONDME_CLIENT_ID / SECONDME_CLIENT_SECRET`，当前以本地匹配模式运行。
+            </p>
+          )}
+        </div>
+
         <p className="mb-4 rounded-xl border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-800">
           当前为 Demo 加速模式：当真实用户不足时，系统会自动补充模拟用户池，确保每次都能完成匹配。
         </p>

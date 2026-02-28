@@ -1,8 +1,14 @@
+import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText } from "ai";
 import { z } from "zod";
 import { normalizeAnswers } from "@/lib/matching";
+import {
+  readSecondMeSession,
+  secondMeApiJson,
+  secondMeChatOnce,
+} from "@/lib/secondme";
 import type { QuestionnaireAnswers } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -95,53 +101,27 @@ async function partnerAgentReply(
   return text.trim();
 }
 
-async function runAgentVsAgent(
-  modelConfig: ModelConfig,
-  candidateName: string,
+async function yourSecondMeAgentReply(
+  accessToken: string,
+  partnerName: string,
   userProfile: QuestionnaireAnswers,
   partnerProfile: QuestionnaireAnswers,
-  turns: number,
+  input: string,
+  sessionId?: string,
 ) {
-  const provider = createOpenAI({
-    apiKey: modelConfig.apiKey,
-    baseURL: modelConfig.baseURL,
-  });
-
-  const { text } = await generateText({
-    model: provider.chat(modelConfig.model),
-    system: [
-      "你是双代理关系协调器。",
-      "请模拟 A(用户代理) 与 B(对方代理) 的多轮对话，目标是互相了解和明确边界。",
-      "必须只输出 JSON 数组，每项格式：{speaker:'A'|'B', text:'...'}。",
-    ].join("\n"),
-    prompt: [
-      `回合数: ${turns}`,
-      `A画像: ${JSON.stringify(profileSummary(userProfile))}`,
-      `B画像: ${JSON.stringify(profileSummary(partnerProfile))}`,
-      "要求：至少出现一次价值观对齐讨论、一次未来规划讨论、一次边界确认。",
+  const response = await secondMeChatOnce(accessToken, {
+    message: input,
+    sessionId,
+    systemPrompt: [
+      "你是用户本人的 SecondMe 沟通代理。",
+      `当前目标：与 ${partnerName} 的代理有效沟通，推进双方了解。`,
+      `用户画像：${JSON.stringify(profileSummary(userProfile))}`,
+      `对方画像：${JSON.stringify(profileSummary(partnerProfile))}`,
+      "请用简洁真诚语气回答，并提出一个澄清问题。",
     ].join("\n"),
   });
 
-  const start = text.indexOf("[");
-  const end = text.lastIndexOf("]");
-
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error("invalid_transcript");
-  }
-
-  const parsed = JSON.parse(text.slice(start, end + 1)) as Array<{
-    speaker: "A" | "B";
-    text: string;
-  }>;
-
-  return parsed
-    .filter((item) => item.text?.trim())
-    .slice(0, turns)
-    .map((item, index) => ({
-      id: `${index + 1}`,
-      speaker: item.speaker === "A" ? "你的Agent" : `${candidateName}的Agent`,
-      text: item.text.trim(),
-    }));
+  return response;
 }
 
 function fallbackPartnerReply(candidateName: string) {
@@ -182,6 +162,28 @@ function fallbackAgentVsAgent(candidateName: string, turns: number) {
   }));
 }
 
+async function ingestSecondMeChatEvent(
+  accessToken: string,
+  mode: "user_to_partner" | "agent_to_agent",
+  candidateName: string,
+  transcriptPreview: string,
+) {
+  await secondMeApiJson("/api/secondme/agent_memory/ingest", accessToken, {
+    method: "POST",
+    body: JSON.stringify({
+      action: "agent_chat_session",
+      displayText: `完成了一次${mode === "user_to_partner" ? "人机" : "双代理"}沟通，目标对象 ${candidateName}`,
+      eventDesc: transcriptPreview.slice(0, 180),
+      importance: 6,
+      channel: "App",
+      payload: {
+        mode,
+        candidateName,
+      },
+    }),
+  });
+}
+
 export async function POST(request: Request) {
   const body = await request.json().catch(() => ({}));
   const parsed = requestSchema.safeParse(body);
@@ -198,6 +200,7 @@ export async function POST(request: Request) {
     parsed.data.partnerProfile as Partial<QuestionnaireAnswers> | null,
   );
   const modelConfig = resolveModelConfig();
+  const session = readSecondMeSession(await cookies());
 
   if (mode === "user_to_partner") {
     const messages = parsed.data.messages ?? [];
@@ -206,18 +209,42 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "messages 不能为空" }, { status: 400 });
     }
 
-    if (!modelConfig) {
-      return NextResponse.json({ reply: fallbackPartnerReply(candidateName) }, { status: 200 });
-    }
-
     try {
-      const reply = await partnerAgentReply(
-        modelConfig,
-        candidateName,
-        userProfile,
-        partnerProfile,
-        messages,
-      );
+      const userInput = messages[messages.length - 1]?.content ?? "";
+      let secondMePart = "";
+
+      if (session?.accessToken) {
+        const self = await yourSecondMeAgentReply(
+          session.accessToken,
+          candidateName,
+          userProfile,
+          partnerProfile,
+          userInput,
+        );
+        secondMePart = `你的SecondMe代理建议：${self.text}`;
+      }
+
+      const partnerReply = modelConfig
+        ? await partnerAgentReply(
+            modelConfig,
+            candidateName,
+            userProfile,
+            partnerProfile,
+            messages,
+          )
+        : fallbackPartnerReply(candidateName);
+
+      const reply = secondMePart
+        ? `${secondMePart}\n\n${candidateName}的Agent回复：${partnerReply}`
+        : partnerReply;
+
+      if (session?.accessToken) {
+        ingestSecondMeChatEvent(session.accessToken, mode, candidateName, reply).catch(
+          () => {
+            return;
+          },
+        );
+      }
 
       return NextResponse.json({ reply }, { status: 200 });
     } catch {
@@ -227,23 +254,84 @@ export async function POST(request: Request) {
 
   const turns = parsed.data.turns ?? 6;
 
-  if (!modelConfig) {
-    return NextResponse.json(
-      {
-        transcript: fallbackAgentVsAgent(candidateName, turns),
-      },
-      { status: 200 },
-    );
-  }
-
   try {
-    const transcript = await runAgentVsAgent(
-      modelConfig,
-      candidateName,
-      userProfile,
-      partnerProfile,
-      turns,
-    );
+    if (!modelConfig) {
+      return NextResponse.json(
+        {
+          transcript: fallbackAgentVsAgent(candidateName, turns),
+        },
+        { status: 200 },
+      );
+    }
+
+    let secondMeSessionId: string | undefined;
+    const transcript: Array<{ id: string; speaker: string; text: string }> = [];
+    let contextMessage = "请先确认关系目标与相处节奏。";
+
+    for (let index = 0; index < turns; index += 1) {
+      if (index % 2 === 0) {
+        if (session?.accessToken) {
+          const self = await yourSecondMeAgentReply(
+            session.accessToken,
+            candidateName,
+            userProfile,
+            partnerProfile,
+            contextMessage,
+            secondMeSessionId,
+          );
+          secondMeSessionId = self.sessionId;
+          transcript.push({
+            id: `${index + 1}`,
+            speaker: "你的SecondMe Agent",
+            text: self.text || "我想先了解你对关系节奏的期待。",
+          });
+          contextMessage = transcript[transcript.length - 1].text;
+        } else {
+          const fallback = fallbackAgentVsAgent(candidateName, turns)[index];
+          transcript.push({
+            id: `${index + 1}`,
+            speaker: "你的Agent",
+            text: fallback?.text ?? "我们先从价值观对齐开始聊。",
+          });
+          contextMessage = transcript[transcript.length - 1].text;
+        }
+      } else {
+        const partnerMessage = await partnerAgentReply(
+          modelConfig,
+          candidateName,
+          userProfile,
+          partnerProfile,
+          transcript.map((item) => ({
+            role:
+              item.speaker === "你的SecondMe Agent" || item.speaker === "你的Agent"
+                ? "user"
+                : "assistant",
+            content: item.text,
+          })),
+        ).catch(() => fallbackPartnerReply(candidateName));
+
+        transcript.push({
+          id: `${index + 1}`,
+          speaker: `${candidateName}的Agent`,
+          text: partnerMessage,
+        });
+
+        contextMessage = partnerMessage;
+      }
+    }
+
+    if (session?.accessToken) {
+      const preview = transcript
+        .map((item) => `${item.speaker}:${item.text}`)
+        .join(" | ")
+        .slice(0, 260);
+
+      ingestSecondMeChatEvent(session.accessToken, mode, candidateName, preview).catch(
+        () => {
+          return;
+        },
+      );
+    }
 
     return NextResponse.json({ transcript }, { status: 200 });
   } catch {

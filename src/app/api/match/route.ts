@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText } from "ai";
@@ -11,6 +12,11 @@ import {
   maskEmail,
   normalizeAnswers,
 } from "@/lib/matching";
+import {
+  loadSecondMeContextFromAccessToken,
+  readSecondMeSession,
+  secondMeApiJson,
+} from "@/lib/secondme";
 import { getSupabaseAdminClient } from "@/lib/supabaseAdmin";
 import type {
   AgentEvaluation,
@@ -53,6 +59,15 @@ type ArenaAgent = {
   weight: number;
 };
 
+type SecondMeSignals = {
+  connected: boolean;
+  regionChangsha: boolean;
+  preferSerious: boolean;
+  inferredInterests: string[];
+  memoryCount: number;
+  summary: string;
+};
+
 const ARENA_AGENTS: ArenaAgent[] = [
   {
     id: "value-scout",
@@ -72,6 +87,20 @@ const ARENA_AGENTS: ArenaAgent[] = [
     focus: "主看未来规划可对齐程度与长期协作潜力。",
     weight: 0.25,
   },
+];
+
+const INTEREST_KEYWORDS = [
+  "citywalk",
+  "咖啡",
+  "徒步",
+  "摄影",
+  "阅读",
+  "音乐",
+  "运动",
+  "旅行",
+  "做饭",
+  "编程",
+  "看展",
 ];
 
 function resolveModelConfig(): ModelConfig | null {
@@ -160,6 +189,70 @@ function hashPayload(payload: Record<string, unknown>) {
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
 }
 
+async function loadSecondMeSignals(): Promise<{ session: ReturnType<typeof readSecondMeSession>; signals: SecondMeSignals }> {
+  const cookieStore = await cookies();
+  const session = readSecondMeSession(cookieStore);
+
+  if (!session) {
+    return {
+      session,
+      signals: {
+        connected: false,
+        regionChangsha: false,
+        preferSerious: false,
+        inferredInterests: [],
+        memoryCount: 0,
+        summary: "未连接 SecondMe",
+      },
+    };
+  }
+
+  try {
+    const context = await loadSecondMeContextFromAccessToken(session.accessToken);
+    const memoryTexts = context.softMemories
+      .map((item) =>
+        [item.displayText, item.eventDesc, JSON.stringify(item.payload ?? {})]
+          .filter(Boolean)
+          .join(" "),
+      )
+      .join(" ");
+    const infoText = JSON.stringify(context.userInfo ?? {});
+    const fullText = `${memoryTexts} ${infoText}`.toLowerCase();
+
+    const inferredInterests = INTEREST_KEYWORDS.filter((keyword) =>
+      fullText.includes(keyword.toLowerCase()),
+    );
+
+    const regionChangsha = fullText.includes("长沙");
+    const preferSerious =
+      fullText.includes("长期") || fullText.includes("稳定") || fullText.includes("认真");
+
+    return {
+      session,
+      signals: {
+        connected: true,
+        regionChangsha,
+        preferSerious,
+        inferredInterests,
+        memoryCount: context.softMemories.length,
+        summary: `SecondMe已连接，读取到 ${context.softMemories.length} 条记忆`,
+      },
+    };
+  } catch {
+    return {
+      session,
+      signals: {
+        connected: false,
+        regionChangsha: false,
+        preferSerious: false,
+        inferredInterests: [],
+        memoryCount: 0,
+        summary: "SecondMe记忆读取失败，已回退本地规则",
+      },
+    };
+  }
+}
+
 async function loadCandidates(currentUserId: string) {
   const admin = getSupabaseAdminClient();
 
@@ -214,6 +307,7 @@ function deterministicAgentRound(
   agent: ArenaAgent,
   currentAnswers: QuestionnaireAnswers,
   candidates: MatchCandidate[],
+  secondMeSignals: SecondMeSignals,
 ): AgentEvaluation[] {
   return candidates.map((candidate) => {
     const base = calculateCompatibility(currentAnswers, candidate.answers);
@@ -221,6 +315,9 @@ function deterministicAgentRound(
 
     if (agent.id === "value-scout") {
       delta = base.reasons[0]?.includes("价值观") ? 6 : -2;
+      if (secondMeSignals.preferSerious && candidate.answers.datePreference === "serious") {
+        delta += 2;
+      }
     }
 
     if (agent.id === "lifestyle-scout") {
@@ -232,6 +329,14 @@ function deterministicAgentRound(
               )
             ? 2
             : -3;
+
+      if (
+        secondMeSignals.inferredInterests.some((item) =>
+          candidate.answers.hobbies.some((hobby) => hobby.toLowerCase().includes(item.toLowerCase())),
+        )
+      ) {
+        delta += 2;
+      }
     }
 
     if (agent.id === "future-scout") {
@@ -242,6 +347,10 @@ function deterministicAgentRound(
         ) <= 1
           ? 5
           : -2;
+
+      if (secondMeSignals.regionChangsha && candidate.answers.futurePlan.includes("长沙")) {
+        delta += 3;
+      }
     }
 
     return {
@@ -263,6 +372,7 @@ async function llmAgentRound(
   agent: ArenaAgent,
   currentAnswers: QuestionnaireAnswers,
   candidates: MatchCandidate[],
+  secondMeSignals: SecondMeSignals,
 ): Promise<AgentEvaluation[] | null> {
   const provider = createOpenAI({
     apiKey: modelConfig.apiKey,
@@ -292,6 +402,7 @@ async function llmAgentRound(
       ].join("\n"),
       prompt: [
         `当前用户问卷: ${JSON.stringify(currentAnswers)}`,
+        `SecondMe记忆信号: ${JSON.stringify(secondMeSignals)}`,
         `候选列表: ${JSON.stringify(candidateSummary)}`,
         "返回格式：",
         JSON.stringify(
@@ -350,6 +461,7 @@ function composeDecision(
   runId: string,
   logs: string[],
   allEvaluations: AgentEvaluation[],
+  secondMeSignals: SecondMeSignals,
 ): MatchDecision {
   const aggregate = candidates
     .map((candidate) => {
@@ -421,6 +533,7 @@ function composeDecision(
     cycleMinutes: 5,
     userId,
     emailMasked: maskEmail(email || "unknown@example.com"),
+    secondMeSignals,
     candidateIds: candidates.map((item) => item.userId),
     evaluations: allEvaluations,
     finalRanking: aggregate.map((item) => ({
@@ -465,6 +578,7 @@ function composeDecision(
       engine: modelConfig ? "multi-agent-arena-llm+rule" : "multi-agent-arena-rule-only",
       provider: modelConfig?.provider ?? null,
       model: modelConfig?.model ?? null,
+      secondMeConnected: secondMeSignals.connected,
       ...arena,
     },
   };
@@ -474,6 +588,7 @@ function emergencyDecision(
   userId: string,
   email: string,
   answers: QuestionnaireAnswers,
+  secondMeSignals: SecondMeSignals,
 ) {
   const emergencyCandidates = ensureSyntheticCandidatePool(
     userId,
@@ -488,7 +603,7 @@ function emergencyDecision(
   ];
 
   const evaluations: AgentEvaluation[] = ARENA_AGENTS.flatMap((agent) =>
-    deterministicAgentRound(agent, answers, emergencyCandidates),
+    deterministicAgentRound(agent, answers, emergencyCandidates, secondMeSignals),
   );
 
   return composeDecision(
@@ -500,6 +615,7 @@ function emergencyDecision(
     randomUUID(),
     logs,
     evaluations,
+    secondMeSignals,
   );
 }
 
@@ -508,20 +624,28 @@ async function buildArenaDecision(
   email: string,
   currentAnswers: QuestionnaireAnswers,
   candidates: MatchCandidate[],
+  secondMeSignals: SecondMeSignals,
 ): Promise<MatchDecision> {
   const modelConfig = resolveModelConfig();
   const runId = randomUUID();
-  const logs: string[] = ["Round 1/3 · 多智能体并行打分开始"];
+  const logs: string[] = ["Round 1/3 · 多智能体并行打分开始", `Memory · ${secondMeSignals.summary}`];
   const allEvaluations: AgentEvaluation[] = [];
 
   for (const agent of ARENA_AGENTS) {
     const llmRound =
       modelConfig === null
         ? null
-        : await llmAgentRound(modelConfig, agent, currentAnswers, candidates);
+        : await llmAgentRound(
+            modelConfig,
+            agent,
+            currentAnswers,
+            candidates,
+            secondMeSignals,
+          );
 
     const evaluations =
-      llmRound ?? deterministicAgentRound(agent, currentAnswers, candidates);
+      llmRound ??
+      deterministicAgentRound(agent, currentAnswers, candidates, secondMeSignals);
     allEvaluations.push(...evaluations);
 
     const vote = [...evaluations].sort((a, b) => b.score - a.score)[0];
@@ -539,6 +663,7 @@ async function buildArenaDecision(
     runId,
     logs,
     allEvaluations,
+    secondMeSignals,
   );
 }
 
@@ -557,6 +682,33 @@ async function persistMatch(result: MatchDecision, userId: string) {
   });
 }
 
+async function ingestMatchMemoryEvent(
+  accessToken: string,
+  result: MatchDecision,
+  userId: string,
+) {
+  const payload = {
+    action: "match_generated",
+    displayText: `系统完成了一次匹配，推荐对象为 ${result.candidateName}`,
+    eventDesc: `run=${result.arena.runId}, score=${result.compatibilityScore}, winner=${result.candidateUserId}`,
+    importance: 7,
+    channel: "App",
+    payload: {
+      userId,
+      winnerUserId: result.candidateUserId,
+      winnerName: result.candidateName,
+      compatibilityScore: result.compatibilityScore,
+      verificationHash: result.arena.verificationHash,
+      fitAdvice: result.fitAdvice,
+    },
+  };
+
+  await secondMeApiJson("/api/secondme/agent_memory/ingest", accessToken, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function POST(request: Request) {
   const raw = await request.json().catch(() => ({} as Record<string, unknown>));
   const parsed = requestSchema.safeParse(raw);
@@ -570,6 +722,8 @@ export async function POST(request: Request) {
       | undefined,
   );
 
+  const { session, signals } = await loadSecondMeSignals();
+
   try {
     const candidates = await loadCandidates(userId);
 
@@ -578,9 +732,16 @@ export async function POST(request: Request) {
       email,
       currentAnswers,
       candidates,
+      signals,
     );
 
     await persistMatch(finalResult, userId);
+
+    if (session?.accessToken) {
+      ingestMatchMemoryEvent(session.accessToken, finalResult, userId).catch(() => {
+        return;
+      });
+    }
 
     return NextResponse.json(
       {
@@ -590,7 +751,13 @@ export async function POST(request: Request) {
       { status: 200 },
     );
   } catch {
-    const fallback = emergencyDecision(userId, email, currentAnswers);
+    const fallback = emergencyDecision(userId, email, currentAnswers, signals);
+
+    if (session?.accessToken) {
+      ingestMatchMemoryEvent(session.accessToken, fallback, userId).catch(() => {
+        return;
+      });
+    }
 
     return NextResponse.json(
       {
