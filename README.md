@@ -32,6 +32,8 @@ cp .env.example .env.local
 - `supabase/schema.sql`
 - 如果你之前已建过表并出现 `ON CONFLICT` 错误，再执行：
 - `supabase/migrations/20260227_fix_questionnaires_unique.sql`
+- 如果出现 `record "new" has no field "updated_at"`，执行：
+- `supabase/migrations/20260228_fix_questionnaires_updated_at_trigger.sql`
 
 4. 启动开发环境
 

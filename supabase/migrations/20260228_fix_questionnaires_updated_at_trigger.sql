@@ -1,5 +1,5 @@
--- Fix existing environments that already created questionnaires without a unique(user_id)
--- Run this once in Supabase SQL Editor before using upsert(onConflict: 'user_id')
+-- Fix: record "new" has no field "updated_at"
+-- Run this in Supabase SQL Editor for existing environments.
 
 alter table public.questionnaires
   add column if not exists created_at timestamptz not null default now();
@@ -7,6 +7,25 @@ alter table public.questionnaires
 alter table public.questionnaires
   add column if not exists updated_at timestamptz not null default now();
 
+create or replace function public.set_current_timestamp_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  if to_jsonb(new) ? 'updated_at' then
+    new := jsonb_populate_record(new, jsonb_build_object('updated_at', now()));
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_questionnaires_updated_at on public.questionnaires;
+create trigger trg_questionnaires_updated_at
+before update on public.questionnaires
+for each row
+execute procedure public.set_current_timestamp_updated_at();
+
+-- Deduplicate user rows and enforce upsert target
 with ranked as (
   select
     id,
@@ -34,21 +53,3 @@ begin
   end if;
 end;
 $$;
-
-create or replace function public.set_current_timestamp_updated_at()
-returns trigger
-language plpgsql
-as $$
-begin
-  if to_jsonb(new) ? 'updated_at' then
-    new := jsonb_populate_record(new, jsonb_build_object('updated_at', now()));
-  end if;
-  return new;
-end;
-$$;
-
-drop trigger if exists trg_questionnaires_updated_at on public.questionnaires;
-create trigger trg_questionnaires_updated_at
-before update on public.questionnaires
-for each row
-execute procedure public.set_current_timestamp_updated_at();

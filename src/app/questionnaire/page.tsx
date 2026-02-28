@@ -103,9 +103,20 @@ export default function QuestionnairePage() {
     );
 
     if (upsertError) {
+      const isUpdatedAtSchemaIssue =
+        upsertError.code === "42703" ||
+        upsertError.message.includes("record \"new\" has no field \"updated_at\"");
       const needFallback =
         upsertError.code === "42P10" ||
         upsertError.message.includes("no unique or exclusion constraint");
+
+      if (isUpdatedAtSchemaIssue) {
+        setSubmitting(false);
+        setStatus(
+          "保存失败：数据库结构缺少 updated_at 字段或触发器异常。请先在 Supabase 执行 supabase/migrations/20260228_fix_questionnaires_updated_at_trigger.sql。",
+        );
+        return;
+      }
 
       if (!needFallback) {
         setSubmitting(false);
